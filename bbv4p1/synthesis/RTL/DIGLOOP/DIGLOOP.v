@@ -1,0 +1,1255 @@
+// `timescale 1s / 1fs
+
+// word width define
+`define WI 9
+`define WF 26
+`define WFPHASE 16
+`define OTW_L 9
+`define DTC_L 12
+
+// -------------------------------------------------------
+// Module Name: LFSR32
+// Function: 32 bit LFSR used in sdm for dither
+// Author: Yang Yumeng Date: 6/26 2021
+// Version: v1p0, cp from BBPLL202108
+// -------------------------------------------------------
+module LFSR32 (
+CLK,
+NRST,
+EN,
+DO,
+URN26
+);
+
+input CLK;
+input NRST;
+input EN;
+output DO;
+output [`WF-1:0] URN26;
+
+wire lfsr_fb;
+reg [32:1] lfsr;
+
+assign DO = EN? lfsr[1]: 1'b0;
+assign URN26 = EN? lfsr[26:1]: 1'b0;
+
+// create feedback polynomials
+assign lfsr_fb = lfsr[32] ^~ lfsr[22] ^~ lfsr[2] ^~ lfsr[1];
+
+always @(posedge CLK or negedge NRST) begin
+	if(!NRST)
+		lfsr <= 32'b1;
+	else if (EN) begin
+		lfsr <= {lfsr[31:1], lfsr_fb};
+	end else begin
+		lfsr <= 32'b1;
+	end
+end
+
+endmodule
+
+// -------------------------------------------------------
+// Module Name: DSM_MESH11_DN
+// Function: modulator for mmd ctrl word
+// Author: Yang Yumeng Date: 6/26 2021
+// Version: v1p0, cp from BBPLL202108
+// -------------------------------------------------------
+module DSM_MESH11_DN (
+CLK,
+NRST,
+EN,
+DN_EN,
+DN_WEIGHT,
+IN,
+OUT,
+PHE
+);
+
+// io
+input CLK;
+input NRST;
+input EN;
+input DN_EN;
+input [4:0] DN_WEIGHT; // dither weight, left shift, 0-31, default is 12
+input [`WF-1:0] IN;
+output reg [2:0] OUT; // sfix, 2-order (-1 to 2)
+output reg [`WF+1:0] PHE; // ufix, 0<x<2
+
+
+// internal signal
+wire [`WF:0] sum1_temp;
+wire [`WF:0] sum2_temp;
+wire [`WF-1:0] sum1;
+wire [`WF-1:0] sum2;
+reg [`WF-1:0] sum1_reg;
+reg [`WF-1:0] sum2_reg;
+wire signed [1:0] ca1;
+wire signed [1:0] ca2;
+reg signed [1:0] ca2_reg; // output combine
+
+wire [`WF-1:0] dn;
+wire [`WF-1:0] dn_n;
+wire [`WF-1:0] dn_y;
+wire LFSR_DN;
+reg dither;
+
+// output generate
+always @ (posedge CLK or negedge NRST) begin
+	if (!NRST) ca2_reg <= 0;
+	else if (EN) begin
+		ca2_reg <= ca2;
+	end
+end
+
+always @ (posedge CLK or negedge NRST) begin
+	if (!NRST) begin
+		OUT <= 0;
+		PHE <= {1'b1, {`WF{1'b0}}};
+	end else if (EN) begin
+		OUT <= ca1 + ca2 - ca2_reg;
+		// OUT <= ca1;
+		// DTC put on REF path
+		PHE <= (ca2<<`WF) - sum1 + {1'b1, {`WF{1'b0}}};
+		// PHE <= - sum1 + {1'b1, {`WF{1'b0}}};
+		// DTC put on CKVD path
+		// PHE <= (-(ca2<<`WF) + sum1 + {2'b01, {`WF{1'b0}}});
+	end
+end
+
+// 2-orser adder
+// assign dither = LFSR_DN;
+always @* begin
+	dither = LFSR_DN;
+end
+
+LFSR32 	DSMMESH11DN_LFSR32 ( .CLK(CLK), .NRST(NRST), .EN(DN_EN), .DO(LFSR_DN), .URN26() );
+
+assign dn_y = (2'b11) << DN_WEIGHT;
+assign dn_n = (2'b01) << DN_WEIGHT;
+assign dn = dither? dn_y: dn_n;
+
+assign sum1_temp = sum1_reg + IN + dn - dn_n;
+assign sum1 = sum1_temp[`WF-1:0];
+assign ca1 = {1'b0, sum1_temp[`WF]};
+always @ (posedge CLK or negedge NRST) begin
+	if (!NRST) sum1_reg <= 0;
+	else if (EN) begin 
+		sum1_reg <= sum1;
+	end
+end
+
+assign sum2_temp = sum2_reg + sum1;
+assign sum2 = sum2_temp[`WF-1:0];
+assign ca2 = {1'b0, sum2_temp[`WF]};
+always @ (posedge CLK or negedge NRST) begin
+	if (!NRST) sum2_reg <= 0;
+	else if (EN) begin 
+		sum2_reg <= sum2;
+	end
+end
+
+// // test signal
+// integer fp1;
+// integer fp2;
+
+// initial fp1 = $fopen("./sdmout.txt");
+// initial fp2 = $fopen("./dither.txt");
+
+// always @ (posedge CLK) begin
+// 	$fstrobe(fp1, "%3.15e %d", $realtime, $signed(OUT));
+// 	$fstrobe(fp2, "%3.15e %d", $realtime, dither);
+// end
+
+endmodule
+// -------------------------------------------------------
+// Module Name: PHASESYNC
+// Function: generate a complement FCW to adjust PLL phase according to NCO & LO phase
+// 			support for /5 mode, add a indicader
+// Author: Yang Yumeng Date: 6/28 2023
+// Version: v1p1
+// -------------------------------------------------------
+module PHASESYNC (
+NRST,
+CKVD,
+SYS_REF,
+SYS_EN,
+FCW,
+LO_PHASECAL_EN,
+LO_PHASECAL_EN_SEL,
+LO_PHASECAL_EN_LO,
+LO_DIV,
+LO_DIV5,
+LO_STATE,
+LO_PCALI_KI,
+LO_PCALI_KI_iir,
+LO_PCALI_DN_EN,
+DSM_BOOTMODE,
+SYS_EDGE_SEL,
+dsm_nrst,
+cali,
+pcali_done
+);
+
+input NRST;
+input CKVD;
+input SYS_REF; // system reference for phase synchronization
+input SYS_EN; // synchronization enable
+input [`WI+`WF-1:0] FCW;
+input LO_PHASECAL_EN;
+input LO_PHASECAL_EN_LO; // lo divider get ready
+input LO_PHASECAL_EN_SEL; // select phase cali en source, 0: spi, 1:lo
+input [2:0] LO_DIV; // LO generate divider 2/4/8/16/32/64/128/256
+input LO_DIV5; // priority than LO_DIV
+input [1:0] LO_STATE; // LO sample I/Q
+input [4:0] LO_PCALI_KI; // range -16 to 15, kdtc cali step
+input [4:0] LO_PCALI_KI_iir; // range 0 to 31, iir scale coefficient
+input LO_PCALI_DN_EN;
+input DSM_BOOTMODE; // mode 0: normal; mode 1: fractional fcw send to DSM untill system ref trigger
+input [2:0] SYS_EDGE_SEL; // select a edge of system ref to reset DSM, 0 is the 1st edge
+output dsm_nrst; // MASH11 DSM rst signal
+output [`WI+`WF-1:0] cali;
+output pcali_done;
+
+wire signed [`WI+`WF-1:0] cali;
+wire signed [`WI+`WF-1:0] fcw_cali_p;
+
+// internal signal
+reg [`WI+`WF-1:0] PACCUM_LIMIT; // LO digital freq accumulation limitation.
+reg [`WI+`WF-1:0] LO_FCW_F;
+wire [`WF-1:0] URN26;
+reg [`WF-1:0] URN26_d1;
+reg [`WI+`WF-1:0] PACCUM_s;
+reg [`WI+`WF-1:0] PACCUM_s_rnd; // with random
+reg [`WFPHASE-1:0] dphase_lo_c;
+reg [`WFPHASE-1:0] dphase_lo_m;
+// phase difference
+reg [`WFPHASE:0] diffphase_temp; // (ufix), 1+16, (0deg,720deg)
+reg [`WFPHASE+1:0] diffphase_comp1;
+reg [`WFPHASE+1:0] diffphase_comp2;
+reg [`WFPHASE:0] diffphase;// (sfix), 1+16, [-180deg,180deg)
+
+reg sys_ref_d1;
+reg sys_ref_d2;
+reg sys_ref_d3;
+reg sys_ref_d4;
+wire sys_comb;
+wire sys_ctrl;
+reg sys_pcali_en; // use it to reset NCO and DSM, is independent with LO_PHASECAL_EN
+reg [2:0] sys_cnt; // counter for posedge of sys ref
+reg sys_mask;
+reg [2:0] sys_edge_sel_reg;
+
+wire phasecal_en;
+assign phasecal_en = LO_PHASECAL_EN_SEL? LO_PHASECAL_EN_LO: LO_PHASECAL_EN;
+
+// reset signal generation
+// counter for system reference
+always @ (posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		sys_cnt <= 0;
+	end else begin
+		if (sys_comb && (sys_cnt<7)) begin
+			sys_cnt <= sys_cnt + 1;
+		end else if (SYS_EN==1'b0) begin
+			sys_cnt <= 0;
+		end
+	end
+end
+
+always @* begin
+	case (sys_edge_sel_reg)
+		3'd0: sys_mask = (sys_cnt==3'd0);
+		3'd1: sys_mask = (sys_cnt==3'd1);
+		3'd2: sys_mask = (sys_cnt==3'd2);
+		3'd3: sys_mask = (sys_cnt==3'd3);
+		3'd4: sys_mask = (sys_cnt==3'd4);
+		3'd5: sys_mask = (sys_cnt==3'd5);
+		3'd6: sys_mask = (sys_cnt==3'd6);
+		3'd7: sys_mask = (sys_cnt==3'd7);
+	endcase
+end
+
+// sys phase
+always @ (posedge CKVD) begin
+	sys_ref_d1 <= SYS_REF;
+	sys_ref_d2 <= sys_ref_d1;
+	sys_ref_d3 <= sys_ref_d2;
+	sys_ref_d4 <= sys_ref_d3;
+	sys_edge_sel_reg <= SYS_EDGE_SEL;
+end
+
+assign sys_comb = sys_ref_d3 & (~sys_ref_d4);
+assign sys_ctrl = SYS_EN & sys_comb & sys_mask;
+always @ (posedge CKVD or negedge NRST) begin
+	if (!NRST) begin 
+		sys_pcali_en <= 1'b0;
+	end else begin
+		if ((sys_pcali_en==1'b0)&&(sys_ctrl==1'b1)) begin
+			sys_pcali_en <= 1'b1;
+		end else if (SYS_EN==1'b0) begin
+			sys_pcali_en <= 1'b0;
+		end
+	end
+end
+
+assign dsm_nrst = DSM_BOOTMODE? sys_pcali_en: (NRST & (~sys_ctrl));
+
+// NCO digital phase generate
+reg [`WI:0] FCW_I_t2;
+reg [`WI-1:0] FCW_I_div5_rem; // range: 0~4
+wire [`WI:0] FCW_I_div5_quo_temp;
+wire [`WI:0] FCW_I_div5_rem_temp;
+
+
+always @* begin
+	// fcw preprocess
+	FCW_I_t2 = FCW[`WI+`WF-1:`WF-1]; // floor(fcw*2)
+	FCW_I_div5_rem = FCW_I_div5_rem_temp;
+	if (LO_DIV5) begin
+		LO_FCW_F = {FCW_I_div5_rem, FCW[`WF-2:0], 1'b0}; // mod(fcw*2, 5)
+		PACCUM_LIMIT = 10'd5 << (`WF);
+	end else begin
+		LO_FCW_F = FCW - ((FCW >> (`WF+LO_DIV)) << (`WF+LO_DIV));
+		PACCUM_LIMIT = 1'b1 << (`WF+LO_DIV);
+	end
+end
+
+// arithmetic divider: DIVA / DIVB = QUO ... REM
+USWI16DIV #(.WI(`WI+1)) DTCMMDCTRL_USWI16DIV ( .DIVA(FCW_I_t2), .DIVB(10'd5), .QUO(FCW_I_div5_quo_temp), .REM(FCW_I_div5_rem_temp) );
+
+// module accumulator
+always @ (posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		PACCUM_s <= 0;
+		URN26_d1 <= 0;
+	end else if (sys_pcali_en) begin
+		if ( ( PACCUM_s + LO_FCW_F ) < PACCUM_LIMIT ) begin
+			PACCUM_s <= PACCUM_s + LO_FCW_F;
+		end else begin
+			PACCUM_s <= PACCUM_s + LO_FCW_F - PACCUM_LIMIT;
+		end
+		URN26_d1 <= URN26;
+	end else begin
+		PACCUM_s <= 0;
+		URN26_d1 <= 0;
+	end
+end
+
+// attach phase dither to NCO
+reg [`WI+`WF-1:0] rand_u; // uniform to 0~1
+always @* begin
+	if (LO_DIV5) begin
+		rand_u = (URN26<<1) + (URN26>>1);
+	end else begin
+		rand_u = ((URN26<<LO_DIV)>>1);
+	end
+	PACCUM_s_rnd = PACCUM_s + rand_u;
+	if (PACCUM_s_rnd < PACCUM_LIMIT) begin
+		PACCUM_s_rnd = PACCUM_s_rnd;
+	end else begin
+		PACCUM_s_rnd = PACCUM_s_rnd - PACCUM_LIMIT;
+	end
+end
+
+LFSR32 	DTCMMDCTRL_LFSR32 ( .CLK(CKVD), .NRST(NRST&sys_pcali_en), .EN(LO_PCALI_DN_EN), .DO() , .URN26(URN26) );
+
+// map lo state to digital phase
+always @ (posedge CKVD or negedge NRST) begin
+	if (!NRST) dphase_lo_m <= 0;
+	else if (sys_pcali_en) begin
+		// i sample, 2 phase egment
+		if (LO_DIV5) begin
+			case (LO_STATE[1]) // LO_I, LO_Q
+				2'b1: dphase_lo_m <= 0;
+				2'b0: dphase_lo_m <= {4'b010_1, {12{1'b0}}}; // 180 deg
+			endcase
+		end else begin
+			case (LO_STATE[1]) // LO_I, LO_Q
+				2'b1: dphase_lo_m <= 0;
+				2'b0: dphase_lo_m <= {2'b10, {14{1'b0}}}; // 180 deg
+			endcase
+		end
+	end else begin
+		dphase_lo_m <= 0;
+	end
+end
+
+// paccum_s_rnd truncate
+always @* begin
+	if (LO_DIV5) begin
+		dphase_lo_c = PACCUM_s_rnd[`WF-14]? (PACCUM_s_rnd[`WI+`WF-1:`WF-13] + 1'b1): (PACCUM_s_rnd[`WI+`WF-1:`WF-13] + 1'b0);
+		// calculate phase difference
+		diffphase_temp = {1'b0, dphase_lo_m} - {1'b0, dphase_lo_c} + (3'd5<<(`WFPHASE-3)); // +360deg
+		diffphase_comp1 = diffphase_temp - (3'd5<<(`WFPHASE-4)); // -180deg
+		diffphase_comp2 = diffphase_temp - (3'd5<<(`WFPHASE-4)) - (3'd5<<(`WFPHASE-3)); // -180deg - 360deg
+		case ({diffphase_comp1[`WFPHASE+1], diffphase_comp2[`WFPHASE+1]})
+			2'b00: diffphase = diffphase_temp - (3'd5<<(`WFPHASE-2)); // -720deg, [-180deg,0deg)
+			2'b01: diffphase = diffphase_temp - (3'd5<<(`WFPHASE-3)); // -360deg, [-180deg,0deg)+[0deg,180deg)
+			2'b11: diffphase = diffphase_temp; // (0deg,180deg)
+			default: diffphase = 0;
+		endcase
+	end else begin
+		dphase_lo_c = (|((1'b1<<(`WF-`WFPHASE-1+LO_DIV))&PACCUM_s_rnd))? ((PACCUM_s_rnd>>(`WF-`WFPHASE+LO_DIV)) + 1'b1): ((PACCUM_s_rnd>>(`WF-`WFPHASE+LO_DIV)) + 1'b0);
+		// calculate phase difference
+		diffphase_temp = {1'b0, dphase_lo_m} - {1'b0, dphase_lo_c} + (1'b1<<(`WFPHASE)); // +360deg
+		diffphase_comp1 = diffphase_temp - (1'b1<<(`WFPHASE-1)); // -180deg
+		diffphase_comp2 = diffphase_temp - (1'b1<<(`WFPHASE-1)) - (1'b1<<(`WFPHASE)); // -180deg - 360deg
+		case ({diffphase_comp1[`WFPHASE+1], diffphase_comp2[`WFPHASE+1]})
+			2'b00: diffphase = diffphase_temp - (1'b1<<(`WFPHASE+1)); // -720deg, [-180deg,0deg)
+			2'b01: diffphase = diffphase_temp - (1'b1<<(`WFPHASE)); // -360deg, [-180deg,0deg)+[0deg,180deg)
+			2'b11: diffphase = diffphase_temp; // (0deg,180deg)
+			default: diffphase = 0;
+		endcase
+	end
+end
+
+reg signed [`WFPHASE:0] lms_err_pcali;
+reg signed [`WFPHASE+8:0] lms_err_pcali_shift;
+reg signed [`WFPHASE:0] lms_err_pcali_abs;
+reg signed [`WFPHASE+8:0] lms_err_pcali_abs_shift;
+
+reg signed [`WFPHASE+8:0] lms_err_pcali_iir;
+reg signed [`WFPHASE+8:0] lms_err_pcali_iir_shift;
+reg signed [`WFPHASE+8:0] lms_err_pcali_iir_abs;
+reg signed [`WFPHASE+8:0] lms_err_pcali_iir_abs_shift;
+
+reg pcali_done;
+
+reg signed [`WFPHASE:0] lms_err_pcali_iir_abs_shift_cut;
+reg signed [`WFPHASE:0] lms_err_pcali_iir_shift_cut;
+
+// reg signed [`WFPHASE:0] lms_err_pcali_iir_abs_comp_shift;
+// reg signed [`WFPHASE:0] lms_err_pcali_iir_comp_shift;
+
+assign fcw_cali_p = (sys_pcali_en&phasecal_en)? (LO_PCALI_KI[4]? (lms_err_pcali >>> (~LO_PCALI_KI+1'b1)): (lms_err_pcali <<< LO_PCALI_KI)):0;
+// assign fcw_cali_p = phasecal_en? lms_err_pcali_iir_comp_shift:0;
+
+assign cali = fcw_cali_p;
+
+always @(posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		lms_err_pcali_iir <= (17'h01000<<8);
+	end else if (sys_pcali_en&phasecal_en) begin
+		lms_err_pcali_iir <= lms_err_pcali_iir - lms_err_pcali_iir_shift + lms_err_pcali_shift;
+	end else begin
+		lms_err_pcali_iir <= (17'h01000<<8);
+	end
+end
+
+always @* begin
+	// initial mu coefficient
+	// lms_err_pcali = sys_pcali_en? (~diffphase + 1'b1): 0;
+	lms_err_pcali = sys_pcali_en? (diffphase[`WFPHASE]? 17'h01000: 17'h1f000): 0;
+	// iir shifter 
+	lms_err_pcali_abs = lms_err_pcali[`WFPHASE]? (~lms_err_pcali+1'b1): lms_err_pcali;
+	lms_err_pcali_abs_shift = lms_err_pcali_abs>>>(2 + LO_PCALI_KI_iir);
+	lms_err_pcali_shift = lms_err_pcali[`WFPHASE]? (~lms_err_pcali_abs_shift+1'b1): lms_err_pcali_abs_shift;
+	// iir shifter 
+	lms_err_pcali_iir_abs = lms_err_pcali_iir[`WFPHASE+8]? (~lms_err_pcali_iir+1'b1): lms_err_pcali_iir;
+	lms_err_pcali_iir_abs_shift = lms_err_pcali_iir_abs>>>(10 + LO_PCALI_KI_iir);
+	lms_err_pcali_iir_shift = lms_err_pcali_iir[`WFPHASE+8]? (~lms_err_pcali_iir_abs_shift+1'b1): lms_err_pcali_iir_abs_shift;
+	// // iir shifter 
+	lms_err_pcali_iir_abs_shift_cut = lms_err_pcali_iir_abs>>>10;
+	lms_err_pcali_iir_shift_cut = lms_err_pcali_iir[`WFPHASE+8]? (~lms_err_pcali_iir_abs_shift_cut+1'b1): lms_err_pcali_iir_abs_shift_cut;
+	// // cali scale factor
+	// lms_err_pcali_iir_abs_comp_shift = LO_PCALI_KI[4]? (lms_err_pcali_iir_abs >>> (~LO_PCALI_KI+1'b1)): (lms_err_pcali_iir_abs <<< LO_PCALI_KI);
+	// lms_err_pcali_iir_comp_shift = lms_err_pcali_iir[`WFPHASE]? (~lms_err_pcali_iir_abs_comp_shift+1'b1): lms_err_pcali_iir_abs_comp_shift;
+end
+
+always @(posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		pcali_done <= 0;
+	end else if (sys_pcali_en&phasecal_en) begin
+		// pcali_done <= (lms_err_pcali_iir_abs_shift_cut < pcali_lock_threshold)? 1: 0;
+		pcali_done <= (lms_err_pcali_iir_abs_shift_cut < 8'h80)? 1: 0;
+	end else begin
+		pcali_done <= 0;
+	end
+end
+
+endmodule
+// -------------------------------------------------------
+// Module Name: DTCMMDCTRL
+// Function: MMD & DTC control logic + DTC gain calibration + phase synchronize
+//			aimed at BBPLL
+// Author: Yang Yumeng Date: 6/15 2023
+// Version: v4p1
+// -------------------------------------------------------
+module DTCMMD_CTRL (
+NRST,
+DN_EN,
+MMD_EN,
+DTC_EN,
+GAC_EN,
+DSM_EN,
+DN_WEIGHT,
+SYS_REF,
+SYS_EN,
+FCW,
+CKVD,
+KDTC_INIT,
+KA,
+PHE_SIG, // SPD
+PHE_SIG2, // PFD
+GAC_MODE,
+MMD_S_DFF,
+MMD_P_DFF,
+DCW_DELAY,
+KDTC_INT,
+LO_PHASECAL_EN,
+LO_DIV,
+LO_DIV5,
+LO_STATE,
+LO_PCALI_KI,
+LO_PCALI_KI_iir,
+LO_PCALI_DN_EN,
+LO_PCALI_DONE,
+LO_PHASECAL_EN_LO,
+LO_PHASECAL_EN_SEL,
+DSM_BOOTMODE,
+SYS_EDGE_SEL
+);
+
+input NRST;
+input DN_EN;
+input MMD_EN;
+input DTC_EN;
+input GAC_EN;
+input DSM_EN;
+input [4:0] DN_WEIGHT;
+input SYS_REF;
+input SYS_EN;
+input [`WI+`WF-1:0] FCW; 
+input CKVD;
+input [12:0] KDTC_INIT; // kdtc range 400~1330, 11bit for int is enough
+input [4:0] KA; // range -16 to 15, kdtc cali step
+input PHE_SIG;
+input PHE_SIG2;
+input GAC_MODE;
+output reg [2:0] MMD_S_DFF;
+output reg [8:0] MMD_P_DFF;
+output reg [`DTC_L-1:0] DCW_DELAY;
+output [12:0] KDTC_INT;
+
+input LO_PHASECAL_EN;
+input LO_PHASECAL_EN_LO;
+input LO_PHASECAL_EN_SEL;
+input DSM_BOOTMODE;
+input [2:0] SYS_EDGE_SEL;
+input [2:0] LO_DIV; // LO generate divider 2/4/8/16/32
+input LO_DIV5;
+input [1:0] LO_STATE; // LO sample I/Q
+input [4:0] LO_PCALI_KI; // range -16 to 15, kdtc cali step
+input [4:0] LO_PCALI_KI_iir;
+input LO_PCALI_DN_EN; // NCO dither
+output LO_PCALI_DONE;
+
+// internal signal
+wire [`WI-1:0] FCW_I;
+wire [`WF-1:0] FCW_F;
+reg [`WI-1:0] FCW_I_reg1;
+wire iDSM_EN;
+wire iDTC_EN;
+wire iGAC_EN;
+wire int_flag;
+wire [2:0] dsm_car; // mesh1-1 (-1 to 2)
+wire [`WF+1:0] dsm_phe; // 0<x<2
+wire [11:0] dsm_phe_trunc; // WI 2 + WF 10
+wire [`WF+15:0] product;
+wire [11:0] dtc_temp;
+wire [11:0] dtc_temp2;
+reg [8:0] mmd_temp_reg;
+reg [8:0] mmd_temp_reg2;
+reg [11:0] dtc_reg;
+
+reg [`WF+1:0] phe_reg1;
+reg [`WF+1:0] phe_reg2;
+reg [`WF+1:0] phe_reg3;
+reg [`WF+1:0] phe_reg4;
+reg [`WF+1:0] phe_sync;
+reg sig_sync;
+reg [`WF+12:0] kdtc_cali;
+wire signed [`WF+1:0] lms_err; // integral range -2<x<0
+wire [`WF+12:0] lms_err_ext; 
+
+wire dsm_nrst;
+wire [`WI+`WF-1:0] fcw_cali;
+wire [`WI+`WF-1:0] cali_comp;
+
+
+assign {FCW_I, FCW_F} = FCW + fcw_cali;
+assign int_flag = |FCW_F;
+assign iDSM_EN = DSM_EN; // disable DSM if fcw is integer
+assign iDTC_EN = DTC_EN;
+assign iGAC_EN = GAC_EN;
+
+always @(posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		FCW_I_reg1 <= 9'd50;
+	end else begin
+		FCW_I_reg1 <= FCW_I;
+	end
+end
+
+PHASESYNC U0_DTCMMDCTRL_PHASESYNC ( .NRST(NRST), .CKVD(CKVD), .SYS_REF(SYS_REF), .SYS_EN(SYS_EN), .FCW(FCW), .LO_PHASECAL_EN(LO_PHASECAL_EN), .LO_PHASECAL_EN_LO(LO_PHASECAL_EN_LO), .LO_PHASECAL_EN_SEL(LO_PHASECAL_EN_SEL), .LO_DIV(LO_DIV), .LO_DIV5(LO_DIV5), .LO_STATE(LO_STATE), .LO_PCALI_KI(LO_PCALI_KI), .LO_PCALI_KI_iir(LO_PCALI_KI_iir), .LO_PCALI_DN_EN(LO_PCALI_DN_EN), .dsm_nrst(dsm_nrst), .cali(fcw_cali), .pcali_done(LO_PCALI_DONE), .DSM_BOOTMODE(DSM_BOOTMODE), .SYS_EDGE_SEL(SYS_EDGE_SEL) );
+
+// MMD CTRL
+// delay DSM -> MMD ctrl word MMD_P_DFF is 3 cycles
+always @ (posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		mmd_temp_reg <= 9'd50;
+		mmd_temp_reg2 <= 9'd50;
+		MMD_P_DFF <= 9'd50;
+	end else begin
+		mmd_temp_reg <= MMD_EN? FCW_I_reg1 + {{(`WI-3){dsm_car[2]}}, dsm_car}: FCW_I_reg1;
+		mmd_temp_reg2 <= MMD_EN? mmd_temp_reg: FCW_I_reg1;
+		MMD_P_DFF <= MMD_EN? mmd_temp_reg: FCW_I_reg1;
+	end
+end
+
+always @ (posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		MMD_S_DFF <= 3'b100;
+	end else begin
+		if (FCW_I_reg1 <= 16) MMD_S_DFF <= 3'b000;
+		else if (FCW_I_reg1 <= 32) MMD_S_DFF <= 3'b001;
+		else if (FCW_I_reg1 <= 64) MMD_S_DFF <= 3'b100;
+		else if (FCW_I_reg1 <= 128) MMD_S_DFF <= 3'b101;
+		else MMD_S_DFF <= 3'b110;
+	end
+end
+
+// DTC CTRL
+// delay DSM -> DTC ctrl word DCW_DELAY is 3 cycles
+SWIWFPRO #(14, 3, `WF) U0_SWIWFPRO_DCWCALC ( .NRST(NRST), .CLK(CKVD), .PROS(product), .MULTIAS({1'b0, kdtc_cali}), .MULTIBS({1'b0, dsm_phe}) );
+assign dtc_temp = product[`WF-1]? (product[11+`WF:`WF] + 1'b1): product[11+`WF:`WF];
+
+always @ (posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		DCW_DELAY <= 0;
+	end else if (iDTC_EN) begin
+		DCW_DELAY <=  dtc_temp;
+	end else begin
+		DCW_DELAY <= 0;
+	end
+end
+
+// DTC GAIN CALI
+
+// generate synchronouse phe and phe_sig
+always @ (posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		sig_sync <= 1'b0;
+		phe_reg1 <= 0;
+		phe_reg2 <= 0;
+		phe_reg3 <= 0;
+		phe_reg4 <= 0;
+		phe_sync <= 0;
+	end else begin
+		sig_sync <= GAC_MODE? PHE_SIG: PHE_SIG2;
+		phe_reg1 <= dsm_phe;
+		phe_reg2 <= phe_reg1;
+		phe_reg3 <= phe_reg2;
+		phe_reg4 <= phe_reg3;
+		phe_sync <= phe_reg4;
+	end
+end
+
+assign lms_err = sig_sync? phe_sync: (~phe_sync + 1'b1); // sig = 1 for kdtc is smaller; sig = 0 for kdtc is larger
+assign lms_err_ext = KA[4]? (lms_err >>> (~KA+1'b1)): (lms_err <<< KA);
+
+always @ (posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		kdtc_cali <= KDTC_INIT<<`WF;
+	end else if (iGAC_EN) begin
+		kdtc_cali <= kdtc_cali + lms_err_ext;
+	end
+end
+
+assign KDTC_INT = kdtc_cali[`WF+12:`WF]; // output for test
+
+// MESH 1-1 DSM
+DSM_MESH11_DN DTCMMDCTRL_DSM ( .CLK (CKVD), .NRST (NRST&dsm_nrst), .EN (iDSM_EN), .DN_EN (DN_EN), .IN (FCW_F), .OUT (dsm_car), .PHE (dsm_phe), .DN_WEIGHT(DN_WEIGHT));
+
+// // test
+// real rphe;
+// real rkdtc;
+// real rk;
+// real rp;
+// real rlms;
+
+// always @* begin
+	// rphe = dsm_phe * (2.0**(-`WF));
+	// rkdtc = kdtc_cali * (2.0**(-`WF));
+	// rp = product * (2.0**(-`WF));
+	// rk = rphe * rkdtc;
+	// rlms = $signed(lms_err_ext) * (2.0**(-`WF));
+// end
+
+endmodule
+// -------------------------------------------------------
+// Module Name: PHESIG_SDM
+// Function: control V-DAC according to phe_sig 
+// Author: Yang Yumeng Date: 4/5 2022
+// Version: v1p0, cp from RTLv1p0
+// -------------------------------------------------------
+module PHESIG_SDM (
+EN,
+NRST,
+CLK,
+ALPHA,
+PHE_SIG,
+OUT,
+OUTN
+);
+
+// io
+input EN;
+input NRST;
+input CLK;
+input [3:0] ALPHA; // fractional part, range 1/16~15/16
+input PHE_SIG;
+output [1:0] OUT;
+output [1:0] OUTN;
+
+// internal signal
+wire [`WF-1:0] beta;
+reg flag; // 1 for increase, 0 for decrease
+reg [`WF-1:0] sdmsum;
+reg [`WF-1:0] sumreg;
+reg [1:0] sdmcarry;
+wire [`WF-1:0] sum;
+wire carry;
+
+// sdm output
+assign OUT = sdmcarry;
+assign OUTN = ~sdmcarry;
+
+// +/-1 SDM
+assign beta = (ALPHA << (`WF-4));
+assign {carry, sum} = sdmsum + beta;
+
+always @(posedge CLK or negedge NRST) begin
+	if (!NRST) begin
+		flag <= 1'b0;
+		sdmsum <= 0;
+		sdmcarry <= 2'b00;
+	end else if (EN) begin
+		if (flag==1'b1) begin
+			flag <= PHE_SIG? 1'b1: 
+					(beta>sdmsum)? 1'b0: 1'b1;
+			sdmsum <= PHE_SIG? (sdmsum+beta):
+					(beta>sdmsum)? (beta-sdmsum): (sdmsum-beta);
+			sdmcarry <= PHE_SIG? {1'b0, carry}: 2'b00;
+		end else begin
+			flag <= (~PHE_SIG)? 1'b0:
+					(beta>sdmsum)? 1'b1: 1'b0;
+			sdmsum <= (~PHE_SIG)? (sdmsum+beta):
+					(beta>sdmsum)? (beta-sdmsum): (sdmsum-beta);
+			sdmcarry <= (~PHE_SIG)? {1'b1, carry}: 2'b00;
+		end
+	end
+end
+
+endmodule
+// -------------------------------------------------------
+// Module Name: OTWCALI
+// Function: after AFC has done, the OTW is locked at a certain value, the variation of temperature will lead VCTRL deviate to the appropriate range.
+// enabel the OTWCALI module to auto adjust the OTW according to the vctrl monitor
+// Author: Yang Yumeng Date: 9/5 2023
+// Version: v1p0
+// -------------------------------------------------------
+module OTWCALI(
+CLK,
+EN,
+NRST,
+VCTEST,
+OTWIN,
+OTWOUT
+);
+
+input CLK;
+input EN;
+input NRST;
+input [1:0] VCTEST; // vctrl monitor detect signal; 2'b10: vc is higher; 2'b01: vc is lower; 2'b00: lock
+input [`OTW_L-1:0] OTWIN;
+output [`OTW_L-1:0] OTWOUT;
+
+// code begin
+reg [9:0] win; // detect window 1024 cycles
+reg flag;
+reg [`OTW_L-1:0] otw_cali;
+reg powerup; // need to distinguish the powerup state or enabel state, cali module will use different otw source as the base
+
+assign OTWOUT = otw_cali;
+
+always @ (posedge CLK or negedge NRST) begin
+	if (!NRST) begin
+		win <= 0;
+		flag <= 0;
+		powerup <= 0;
+	end else if (EN) begin
+		win <= win + 1;
+		flag <= (win==1023)? 1: 0;
+		powerup <= 1;
+	end else begin
+		win <= 0;
+		flag <= 0;
+		powerup <= powerup;
+	end
+end
+
+always @ (posedge CLK or negedge NRST) begin
+	if (!NRST) begin
+		otw_cali <= (1'b1 << (`OTW_L-1));
+	end else if (EN) begin
+		if (flag) begin // otw cali
+			case (VCTEST)
+				2'b10: otw_cali <= otw_cali + 1;
+				2'b01: otw_cali <= otw_cali - 1;
+				default: otw_cali <= otw_cali;
+			endcase
+		end
+	end else begin
+		otw_cali <= powerup? otw_cali: OTWIN;
+	end
+end
+
+endmodule
+// -------------------------------------------------------
+// Module Name: CTRLMUX
+// Function: multiplexer for control signal, enabel signal
+// Author: Yang Yumeng Date: 4/5 2022
+// Version: v1p0
+// -------------------------------------------------------
+module CTRLMUX (
+SPI_PLL_EN,
+// afc ctrl
+AFC_CTRL,
+AFC_OTWP, AFC_OTWN,
+// spi ctrl
+SPI_CTRL,
+SPI_PHESIG_GEN_EN, SPI_DTC_GAINCAL_EN, SPI_DTC_EN, SPI_MMD_EN, SPI_DSM_EN, SPI_DN_EN, SPI_SPD_EN, SPI_PFD_EN, SPI_CP_EN, SPI_PRECHARGE_EN,
+SPI_CP, SPI_CS, SPI_OTWSOURCE,
+SPI_MMD_P, SPI_MMD_S,
+// loop ctrl
+LOOP_MMD_P, LOOP_MMD_S,
+// output 
+O_PHESIG_GEN_EN, O_DTC_GAINCAL_EN, O_DTC_EN, O_MMD_EN, O_DSM_EN, O_DN_EN, O_SPD_EN, O_PFD_EN, O_CP_EN, O_PRECHARGE_EN,
+O_MMD_P, O_MMD_S,
+O_CP, O_CS, O_CP_N, O_CS_N,
+// for otw cali
+CKVD, SPI_OTWCALI_EN, NRST, VCTEST
+);
+
+input SPI_PLL_EN;			// all enable signal canbe disable
+
+input AFC_CTRL;				// en signal ctrl right to afc
+input [8:0] SPI_MMD_P;
+input [2:0] SPI_MMD_S;
+input [`OTW_L-1:0] AFC_OTWP;
+input [`OTW_L-1:0] AFC_OTWN;
+
+input SPI_CTRL;				// en signal ctrl right to spi
+input SPI_PHESIG_GEN_EN;
+input SPI_DTC_GAINCAL_EN;
+input SPI_DTC_EN;
+input SPI_MMD_EN;
+input SPI_DSM_EN;
+input SPI_DN_EN;
+input SPI_SPD_EN;
+input SPI_PFD_EN;
+input SPI_CP_EN;
+input SPI_PRECHARGE_EN;
+input [`OTW_L-1:0] SPI_CP;
+input [`OTW_L-1:0] SPI_CS;
+input SPI_OTWSOURCE;
+
+input [8:0] LOOP_MMD_P;
+input [2:0] LOOP_MMD_S;
+
+output O_PHESIG_GEN_EN;
+output O_DTC_GAINCAL_EN;
+output O_DTC_EN;
+output O_MMD_EN;
+output O_DSM_EN;
+output O_DN_EN;
+output O_SPD_EN;
+output O_PFD_EN;
+output O_CP_EN;
+output O_PRECHARGE_EN;
+output [8:0] O_MMD_P;
+output [2:0] O_MMD_S;
+output [`OTW_L-1:0] O_CP;
+output [`OTW_L-1:0] O_CS;
+output [`OTW_L-1:0] O_CP_N;
+output [`OTW_L-1:0] O_CS_N;
+
+input CKVD;
+input SPI_OTWCALI_EN;
+input NRST;
+input [1:0] VCTEST;
+
+// MODELMUX
+wire S;
+reg [`OTW_L-1:0] OTWP;
+reg [`OTW_L-1:0] OTWN;
+
+// mux begin
+// mux sel ctrl SPI-0/AFC-1
+// AFC_CTRL		SPI_CTRL		CONTROLLOR
+// 0			0				SPI
+// 0			1				SPI
+// 1			0				AFC **
+// 1			1				SPI
+// assign S = (~SPI_CTRL) & AFC_CTRL;
+
+assign S = (~SPI_CTRL) & (AFC_CTRL); //S=0 for SPI mode
+
+// ENABLE
+assign O_PHESIG_GEN_EN 	= SPI_PLL_EN? (S? 0: SPI_PHESIG_GEN_EN): 0;
+assign O_DTC_GAINCAL_EN = SPI_PLL_EN? (S? 0: SPI_DTC_GAINCAL_EN): 0;
+assign O_DTC_EN 		= SPI_PLL_EN? (S? 0: SPI_DTC_EN): 0;
+assign O_MMD_EN 		= SPI_PLL_EN? (S? 0: SPI_MMD_EN): 0;
+assign O_DSM_EN 		= SPI_PLL_EN? (S? 0: SPI_DSM_EN): 0;
+assign O_DN_EN 			= SPI_PLL_EN? (S? 0: SPI_DN_EN): 0;
+assign O_SPD_EN 		= SPI_PLL_EN? (S? 0: SPI_SPD_EN): 0;
+assign O_PFD_EN 		= SPI_PLL_EN? (S? 0: SPI_PFD_EN): 0;
+assign O_CP_EN 			= SPI_PLL_EN? (S? 0: SPI_CP_EN): 0;
+assign O_PRECHARGE_EN 	= (S? 1: SPI_PRECHARGE_EN);
+
+// OTW
+always @* begin
+	OTWP = AFC_OTWP;
+	OTWN = AFC_OTWN;
+end
+
+// OTW cali
+wire [`OTW_L-1:0] OTWP_cali; 
+
+OTWCALI U0_OTWCALI (
+.CLK		(CKVD),	
+.EN			(SPI_OTWCALI_EN),
+.NRST		(NRST),	
+.VCTEST		(VCTEST),	
+.OTWIN		(OTWP),	
+.OTWOUT		(OTWP_cali)
+);
+
+// SPI_OTWSOURCE SPI-0/AFC-1
+assign O_CP = SPI_OTWSOURCE? OTWP_cali: SPI_CP;
+assign O_CS = SPI_OTWSOURCE? OTWP_cali: SPI_CS;
+assign O_CP_N = SPI_OTWSOURCE? ~OTWP_cali: ~SPI_CP;
+assign O_CS_N = SPI_OTWSOURCE? ~OTWP_cali: ~SPI_CS;
+
+// MMD CTRL
+assign O_MMD_P = S? SPI_MMD_P: LOOP_MMD_P;
+assign O_MMD_S = S? SPI_MMD_S: LOOP_MMD_S;
+
+endmodule
+// -------------------------------------------------------
+// Module Name: DIGLOOP
+// Function: digital loop top
+// Author: Yang Yumeng Date: 4/5 2022
+// Version: v1p0
+// -------------------------------------------------------
+module DIGLOOP (
+// rst clk w
+SPI_NARST,
+CKVD,
+SPI_CONFIG,
+// synchronous
+SYNC_EN,
+SYNC_REF,
+// SPI input
+SPI_PLL_EN, SPI_CTRL, AFC_CTRL, FREQLOCK,
+SPI_PHESIG_GEN_EN, SPI_DTC_GAINCAL_EN, SPI_DTC_EN, SPI_MMD_EN, SPI_DSM_EN, SPI_DN_EN, SPI_SPD_EN, SPI_PFD_EN, SPI_CP_EN, SPI_PRECHARGE_EN,
+SPI_FCW, SPI_KDTC_INIT, SPI_KA, SPI_ALPHA, SPI_DN_WEIGHT, SPI_CAL_MODE,
+
+SPI_CP, SPI_CS, SPI_OTWSOURCE, SPI_OTWSEL,
+
+SPI_FCW_MULTI, SPI_MMD_P, SPI_MMD_S,
+AFC_OTWP, AFC_OTWN,
+
+PHE_SIG, PHE_SIG2, LO_PHASECAL_EN_LO,
+
+LO_STATE, SPI_LO_DIV, SPI_LO_DIV5, SPI_LO_PCALI_KI, SPI_LO_PCALI_KI_iir, SPI_LO_PCALI_DN_EN, SPI_LO_PHASECAL_EN, SPI_LO_PHASECAL_EN_SEL, SPI_DSM_BOOTMODE, SPI_SYS_EDGE_SEL,
+// output
+O_PHESIG_GEN_EN, O_DTC_GAINCAL_EN, O_DN_EN, O_DTC_EN, O_MMD_EN, O_DSM_EN, O_PRECHARGE_EN, O_PFD_EN, O_CP_EN, O_SPD_EN,
+O_MMD_P, O_MMD_S, DCW_DELAY, VDACCTRL_OUTP, VDACCTRL_OUTN,
+SPI_FCW_O, SPI_MMD_P_O, SPI_MMD_S_O, SPI_FCW_MULTI_O,
+O_CP, O_CS, O_CP_N, O_CS_N, SPI_OTWSEL_O,
+KDTC_INT, FLOCK, LO_PCALI_DONE,
+// for OTW cali
+VCTEST, SPI_OTWCALI_EN
+);
+
+// rst
+input SPI_NARST;
+input SYNC_EN;
+input SYNC_REF;
+
+// CLK
+input CKVD;
+input SPI_CONFIG;
+input [`WI+`WF-1:0] SPI_FCW;
+input PHE_SIG;
+input PHE_SIG2;
+output reg [`WI+`WF-1:0] SPI_FCW_O;
+
+input SPI_PLL_EN;			// all enable signal canbe disable
+
+input AFC_CTRL;				// en signal ctrl right to afc
+input FREQLOCK;
+input [`OTW_L-1:0] AFC_OTWP;
+input [`OTW_L-1:0] AFC_OTWN;
+
+input SPI_CTRL;				// en signal ctrl right to spi
+input SPI_PHESIG_GEN_EN;
+input SPI_DTC_GAINCAL_EN;
+input SPI_DTC_EN;
+input SPI_MMD_EN;
+input SPI_DSM_EN;
+input SPI_DN_EN;
+input SPI_SPD_EN;
+input SPI_PFD_EN;
+input SPI_CP_EN;
+input SPI_PRECHARGE_EN;
+input [12:0] SPI_KDTC_INIT;
+input [4:0] SPI_KA;
+input [3:0] SPI_ALPHA;
+input [4:0] SPI_DN_WEIGHT;
+input SPI_CAL_MODE;
+input [`OTW_L-1:0] SPI_CP;
+input [`OTW_L-1:0] SPI_CS;
+input SPI_OTWSOURCE; // determin otw controlled by afc or spi
+input [2:0]  SPI_OTWSEL;
+
+input [6:0] SPI_FCW_MULTI;
+input [8:0] SPI_MMD_P;
+input [2:0] SPI_MMD_S;
+
+input SPI_LO_PHASECAL_EN;
+input [2:0] SPI_LO_DIV;
+input SPI_LO_DIV5;
+input [4:0] SPI_LO_PCALI_KI;
+input [4:0] SPI_LO_PCALI_KI_iir;
+input SPI_LO_PCALI_DN_EN;
+input [1:0] LO_STATE;
+input LO_PHASECAL_EN_LO;
+input SPI_LO_PHASECAL_EN_SEL;
+input SPI_DSM_BOOTMODE;
+input [2:0] SPI_SYS_EDGE_SEL;
+
+// DTC MMD CTRL
+wire NRST;
+wire NRST1;
+wire NRST2;
+wire inrst;
+
+reg [12:0] SPI_KDTC_INIT_O;
+reg [4:0] SPI_KA_O;
+reg [3:0] SPI_ALPHA_O;
+reg [4:0] SPI_DN_WEIGHT_O;
+reg SPI_OTWSOURCE_O;
+reg [`OTW_L-1:0] SPI_CP_O;
+reg [`OTW_L-1:0] SPI_CS_O;
+reg SPI_CAL_MODE_O;
+reg [2:0] SPI_LO_DIV_O;
+reg SPI_LO_DIV5_O;
+reg [4:0] SPI_LO_PCALI_KI_O;
+reg [4:0] SPI_LO_PCALI_KI_iir_O;
+reg SPI_LO_PCALI_DN_EN_O;
+reg SPI_LO_PHASECAL_EN_O;
+
+wire [8:0] MMD_DCW;
+wire [2:0] MMD_S;
+output [1:0] VDACCTRL_OUTP;
+output [1:0] VDACCTRL_OUTN;
+output reg [8:0] SPI_MMD_P_O;
+output reg [2:0] SPI_MMD_S_O;
+output reg [6:0] SPI_FCW_MULTI_O;
+output [11:0] DCW_DELAY;
+output [8:0] O_MMD_P;
+output [2:0] O_MMD_S;
+output [`OTW_L-1:0] O_CP;
+output [`OTW_L-1:0] O_CS;
+output [`OTW_L-1:0] O_CP_N;
+output [`OTW_L-1:0] O_CS_N;
+output reg [2:0] SPI_OTWSEL_O;
+
+output O_PHESIG_GEN_EN;
+output O_DTC_GAINCAL_EN;
+output O_DN_EN;
+output O_DTC_EN;
+output O_MMD_EN;
+output O_DSM_EN;
+output O_PRECHARGE_EN;
+output O_PFD_EN;
+output O_CP_EN;
+output O_SPD_EN;
+
+// output to spi reg
+output [12:0] KDTC_INT;
+output FLOCK;
+output LO_PCALI_DONE;
+
+// for otw cali
+input SPI_OTWCALI_EN;
+input [1:0] VCTEST;
+
+// input register
+reg conf_reg;
+wire conf_win;
+
+assign conf_win = conf_reg;
+
+assign inrst = NRST;
+
+always @ (posedge CKVD or negedge inrst) begin
+	if (!inrst) begin
+		conf_reg <= 1'b1;
+	end else if (SPI_CONFIG) conf_reg <= 1'b1;
+	else conf_reg <= 1'b0;
+end
+
+assign FLOCK = FREQLOCK;
+
+always @ (posedge CKVD or negedge NRST) begin
+	if (!NRST) begin
+		// spi ctrl init
+		SPI_FCW_O		<= SPI_FCW;
+		SPI_KA_O 		<= SPI_KA;
+		SPI_ALPHA_O		<= SPI_ALPHA;
+		SPI_KDTC_INIT_O <= SPI_KDTC_INIT;
+		SPI_DN_WEIGHT_O <= SPI_DN_WEIGHT;
+		SPI_OTWSOURCE_O	<= SPI_OTWSOURCE;
+		SPI_OTWSEL_O	<= SPI_OTWSEL;
+		SPI_CP_O		<= SPI_CP;
+		SPI_CS_O		<= SPI_CS;
+		SPI_MMD_P_O		<= SPI_MMD_P;
+		SPI_MMD_S_O		<= SPI_MMD_S;
+		SPI_FCW_MULTI_O	<= SPI_FCW_MULTI;
+		SPI_CAL_MODE_O	<= SPI_CAL_MODE;
+		SPI_LO_DIV_O		<= SPI_LO_DIV;
+		SPI_LO_DIV5_O		<= SPI_LO_DIV5;
+		SPI_LO_PCALI_KI_O	<= SPI_LO_PCALI_KI;
+		SPI_LO_PCALI_KI_iir_O	<= SPI_LO_PCALI_KI_iir;
+		SPI_LO_PCALI_DN_EN_O<= SPI_LO_PCALI_DN_EN;
+		SPI_LO_PHASECAL_EN_O<= SPI_LO_PHASECAL_EN;
+	end else if (conf_win) begin
+		SPI_FCW_O		<= SPI_FCW;
+		SPI_KA_O 		<= SPI_KA;
+		SPI_ALPHA_O		<= SPI_ALPHA;
+		SPI_KDTC_INIT_O <= SPI_KDTC_INIT;
+		SPI_DN_WEIGHT_O <= SPI_DN_WEIGHT;
+		SPI_OTWSOURCE_O	<= SPI_OTWSOURCE;
+		SPI_OTWSEL_O	<= SPI_OTWSEL;
+		SPI_CP_O		<= SPI_CP;
+		SPI_CS_O		<= SPI_CS;
+		SPI_MMD_P_O		<= SPI_MMD_P;
+		SPI_MMD_S_O		<= SPI_MMD_S;
+		SPI_FCW_MULTI_O	<= SPI_FCW_MULTI;
+		SPI_CAL_MODE_O	<= SPI_CAL_MODE;
+		SPI_LO_DIV_O		<= SPI_LO_DIV;
+		SPI_LO_DIV5_O		<= SPI_LO_DIV5;
+		SPI_LO_PCALI_KI_O	<= SPI_LO_PCALI_KI;
+		SPI_LO_PCALI_KI_iir_O	<= SPI_LO_PCALI_KI_iir;
+		SPI_LO_PCALI_DN_EN_O<= SPI_LO_PCALI_DN_EN;
+		SPI_LO_PHASECAL_EN_O<= SPI_LO_PHASECAL_EN;
+	end
+end
+
+CTRLMUX U0_MUX (
+.LOOP_MMD_P			(MMD_DCW			),
+.LOOP_MMD_S 		(MMD_S				),
+.SPI_PLL_EN         (SPI_PLL_EN         ),
+.AFC_CTRL           (AFC_CTRL           ),
+.SPI_MMD_P          (SPI_MMD_P_O        ),
+.SPI_MMD_S          (SPI_MMD_S_O        ),
+.AFC_OTWP           (AFC_OTWP           ),
+.AFC_OTWN           (AFC_OTWN           ),
+.SPI_CTRL           (SPI_CTRL           ),
+.SPI_PHESIG_GEN_EN 	(SPI_PHESIG_GEN_EN ),
+.SPI_DTC_GAINCAL_EN (SPI_DTC_GAINCAL_EN ),
+.SPI_DTC_EN         (SPI_DTC_EN         ),
+.SPI_MMD_EN         (SPI_MMD_EN         ),
+.SPI_DSM_EN         (SPI_DSM_EN         ),
+.SPI_DN_EN          (SPI_DN_EN          ),
+.SPI_SPD_EN			(SPI_SPD_EN			),
+.SPI_PFD_EN			(SPI_PFD_EN			),
+.SPI_CP_EN			(SPI_CP_EN			),
+.SPI_PRECHARGE_EN	(SPI_PRECHARGE_EN	),
+.SPI_CP				(SPI_CP_O			),
+.SPI_CS				(SPI_CS_O			),
+.SPI_OTWSOURCE    	(SPI_OTWSOURCE_O   	),
+.O_PHESIG_GEN_EN	(O_PHESIG_GEN_EN 	),
+.O_DTC_GAINCAL_EN   (O_DTC_GAINCAL_EN   ),
+.O_DTC_EN           (O_DTC_EN           ),
+.O_MMD_EN           (O_MMD_EN           ),
+.O_DSM_EN           (O_DSM_EN           ),
+.O_DN_EN            (O_DN_EN            ),
+.O_SPD_EN			(O_SPD_EN			),
+.O_PFD_EN			(O_PFD_EN			),
+.O_CP_EN			(O_CP_EN			),
+.O_PRECHARGE_EN		(O_PRECHARGE_EN		),
+.O_MMD_P            (O_MMD_P            ),
+.O_MMD_S	        (O_MMD_S            ),
+.O_CP             	(O_CP             	),
+.O_CS             	(O_CS             	),
+.O_CP_N            	(O_CP_N            	),
+.O_CS_N            	(O_CS_N            	),
+.CKVD				(CKVD),
+.SPI_OTWCALI_EN		(SPI_OTWCALI_EN),
+.NRST				(inrst),
+.VCTEST				(VCTEST)
+);
+
+DTCMMD_CTRL U0_DTCMMDCTRL(
+.NRST			(inrst				),
+.DSM_EN			(O_DSM_EN			),
+.DN_EN			(O_DN_EN			),
+.DN_WEIGHT		(SPI_DN_WEIGHT_O	),
+.MMD_EN			(O_MMD_EN			),
+.DTC_EN			(O_DTC_EN			),
+.GAC_EN			(O_DTC_GAINCAL_EN	),
+.SYS_REF		(SYNC_REF			),
+.SYS_EN			(SYNC_EN			),
+.FCW			(SPI_FCW_O			),
+.CKVD			(CKVD				),
+.KDTC_INIT		(SPI_KDTC_INIT_O	),
+.KA				(SPI_KA_O			),
+.PHE_SIG		(PHE_SIG			),
+.PHE_SIG2		(PHE_SIG2			),
+.GAC_MODE		(SPI_CAL_MODE_O		),
+.MMD_S_DFF		(MMD_S				),
+.MMD_P_DFF		(MMD_DCW			),
+.DCW_DELAY		(DCW_DELAY			),
+.KDTC_INT		(KDTC_INT			),
+.LO_PHASECAL_EN	(SPI_LO_PHASECAL_EN_O),
+.LO_DIV			(SPI_LO_DIV_O		),
+.LO_DIV5		(SPI_LO_DIV5_O		),
+.LO_STATE		(LO_STATE			),
+.LO_PCALI_KI	(SPI_LO_PCALI_KI_O	),
+.LO_PCALI_KI_iir(SPI_LO_PCALI_KI_iir_O	),
+.LO_PCALI_DN_EN	(SPI_LO_PCALI_DN_EN_O),
+.LO_PCALI_DONE 	(LO_PCALI_DONE),
+.LO_PHASECAL_EN_LO	(LO_PHASECAL_EN_LO),
+.LO_PHASECAL_EN_SEL	(SPI_LO_PHASECAL_EN_SEL),
+.DSM_BOOTMODE		(SPI_DSM_BOOTMODE),
+.SYS_EDGE_SEL		(SPI_SYS_EDGE_SEL)
+);
+
+PHESIG_SDM U0_PHESIG_SDM(
+.EN			(O_PHESIG_GEN_EN),
+.NRST		(inrst),
+.CLK		(CKVD),
+.ALPHA		(SPI_ALPHA_O),
+.PHE_SIG	(PHE_SIG),
+.OUT		(VDACCTRL_OUTP),
+.OUTN       (VDACCTRL_OUTN)
+);
+
+SYNCRSTGEN U0_SYNCRST( .CLK (CKVD), .NARST (SPI_NARST), .NRST (NRST), .NRST1 (NRST1), .NRST2(NRST2));
+
+endmodule
